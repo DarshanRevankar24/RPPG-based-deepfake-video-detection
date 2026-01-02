@@ -6,37 +6,33 @@ from scipy.fft import fft, fftfreq
 import matplotlib.pyplot as plt
 import os
 
-# -------------------- MediaPipe --------------------
+
 mp_face = mp.solutions.face_mesh.FaceMesh(
     static_image_mode=False,
     max_num_faces=1,
     refine_landmarks=True
 )
 
-# -------------------- Filters --------------------
+
 def bandpass_filter(signal, fps):
     low = 0.8 / (fps / 2)
     high = 3.0 / (fps / 2)
     b, a = butter(3, [low, high], btype='band')
     return filtfilt(b, a, signal)
 
-# -------------------- ROI extraction --------------------
+
 def get_roi_from_landmarks(frame, landmarks, indices):
     h, w, _ = frame.shape
     xs, ys = [], []
-
     for idx in indices:
         lm = landmarks[idx]
         xs.append(int(lm.x * w))
         ys.append(int(lm.y * h))
-
     x1, x2 = max(min(xs), 0), min(max(xs), w)
     y1, y2 = max(min(ys), 0), min(max(ys), h)
+    return frame[y1:y2, x1:x2]
 
-    roi = frame[y1:y2, x1:x2]
-    return roi
 
-# -------------------- Motion Estimation --------------------
 def frame_motion(prev_gray, gray):
     flow = cv2.calcOpticalFlowFarneback(
         prev_gray, gray, None,
@@ -44,21 +40,43 @@ def frame_motion(prev_gray, gray):
     )
     return np.mean(np.abs(flow))
 
-# -------------------- Main rPPG Extraction --------------------
+
+def detect_abnormal_segments(signal, fps):
+    window_sec = 0.4
+    step_sec = 0.2
+    window = int(window_sec * fps)
+    step = int(step_sec * fps)
+
+    if len(signal) < window:
+        return []
+
+    global_amp = np.max(signal) - np.min(signal)
+    threshold = 1.5 * global_amp  # lower threshold to detect smaller spikes
+
+    suspicious = []
+    for start in range(0, len(signal) - window, step):
+        segment = signal[start:start + window]
+        local_amp = np.max(segment) - np.min(segment)
+        if local_amp > threshold:
+            suspicious.append({
+                "start_time_sec": round(start / fps, 2),
+                "end_time_sec": round((start + window) / fps, 2),
+                "reason": "Abnormal rPPG amplitude spike"
+            })
+    return suspicious
+
+
 def extract_rppg(video_path):
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
 
     forehead_signal = []
     cheek_signal = []
-
     total_frames = 0
     used_frames = 0
-
     prev_gray = None
     motion_scores = []
 
-    # Landmark indices
     FOREHEAD = [10, 67, 69, 104]
     LEFT_CHEEK = [234, 93, 132]
     RIGHT_CHEEK = [454, 323, 361]
@@ -67,9 +85,7 @@ def extract_rppg(video_path):
         ret, frame = cap.read()
         if not ret:
             break
-
         total_frames += 1
-
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = mp_face.process(rgb)
@@ -82,20 +98,15 @@ def extract_rppg(video_path):
             continue
 
         landmarks = results.multi_face_landmarks[0].landmark
-
-        roi_forehead = get_roi_from_landmarks(frame, landmarks, FOREHEAD)
+        roi_f = get_roi_from_landmarks(frame, landmarks, FOREHEAD)
         roi_l = get_roi_from_landmarks(frame, landmarks, LEFT_CHEEK)
         roi_r = get_roi_from_landmarks(frame, landmarks, RIGHT_CHEEK)
 
-        if roi_forehead.size == 0 or roi_l.size == 0 or roi_r.size == 0:
+        if roi_f.size == 0 or roi_l.size == 0 or roi_r.size == 0:
             continue
 
-        # Green channel extraction
-        g_forehead = np.mean(roi_forehead[:, :, 1])
-        g_cheek = (np.mean(roi_l[:, :, 1]) + np.mean(roi_r[:, :, 1])) / 2
-
-        forehead_signal.append(g_forehead)
-        cheek_signal.append(g_cheek)
+        forehead_signal.append(np.mean(roi_f[:, :, 1]))
+        cheek_signal.append((np.mean(roi_l[:, :, 1]) + np.mean(roi_r[:, :, 1])) / 2)
         used_frames += 1
 
     cap.release()
@@ -108,30 +119,20 @@ def extract_rppg(video_path):
             "used_frames": used_frames
         }
 
-    # -------------------- Motion rejection --------------------
-    motion_scores = np.array(motion_scores)
-    motion_penalty = np.mean(motion_scores)
+    motion_penalty = np.mean(motion_scores) if motion_scores else 0
+    fused = 0.6 * np.array(forehead_signal) + 0.4 * np.array(cheek_signal)
+    filtered = bandpass_filter(fused, fps)
 
-    # -------------------- Signal fusion --------------------
-    forehead_signal = np.array(forehead_signal)
-    cheek_signal = np.array(cheek_signal)
-
-    fused_signal = 0.6 * forehead_signal + 0.4 * cheek_signal
-    filtered = bandpass_filter(fused_signal, fps)
-
-    # -------------------- Signal Quality --------------------
     strength = np.std(filtered)
     fft_vals = np.abs(fft(filtered))
     freqs = fftfreq(len(fft_vals), d=1/fps)
-
     hr_band = (freqs > 0.8) & (freqs < 3.0)
     sqi = np.sum(fft_vals[hr_band]) / np.sum(fft_vals)
-
     confidence = min((strength * sqi) / (1 + motion_penalty), 1.0)
 
-    # -------------------- Save plots --------------------
-    os.makedirs("plots", exist_ok=True)
+    suspicious_segments = detect_abnormal_segments(filtered, fps)
 
+    os.makedirs("plots", exist_ok=True)
     plt.figure()
     plt.plot(filtered)
     plt.title("Fused rPPG Signal")
@@ -158,5 +159,6 @@ def extract_rppg(video_path):
         "total_frames": total_frames,
         "used_frames": used_frames,
         "waveform_plot": waveform_path,
-        "fft_plot": fft_path
+        "fft_plot": fft_path,
+        "suspicious_segments": suspicious_segments if suspicious_segments else None
     }, None

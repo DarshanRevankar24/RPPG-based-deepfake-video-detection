@@ -23,27 +23,22 @@ async def detect_video(file: UploadFile = File(...)):
             "reason": error["error"],
             "fps": error["fps"],
             "total_frames": error["total_frames"],
-            "used_frames": error["used_frames"]
+            "used_frames": error["used_frames"],
+            "suspicious_rppg_segments": None
         }
 
     THRESHOLD = 0.02
-
     verdict = "REAL" if result["strength"] >= THRESHOLD else "FAKE"
-
-    reason = (
-        "Valid physiological heartbeat detected"
-        if verdict == "REAL"
-        else "No stable rPPG heartbeat detected"
-    )
 
     return {
         "verdict": verdict,
-        "reason": reason,
+        "reason": "Valid physiological heartbeat detected" if verdict == "REAL" else "No stable rPPG detected",
         "heartbeat_strength": result["strength"],
         "confidence_score": result["confidence"],
         "fps": result["fps"],
         "total_frames": result["total_frames"],
         "used_frames": result["used_frames"],
         "rppg_waveform_plot": result["waveform_plot"],
-        "fft_spectrum_plot": result["fft_plot"]
+        "fft_spectrum_plot": result["fft_plot"],
+        "suspicious_rppg_segments": result["suspicious_segments"]
     }

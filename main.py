@@ -120,7 +120,30 @@ async def detect_video(file: UploadFile = File(...)):
 
     return response
 
+@app.delete("/cleanup")
+async def cleanup_files():
 
+    
+    deleted_count = 0
+    
+    # Clean uploads
+    if os.path.exists(UPLOAD_DIR):
+        for file in os.listdir(UPLOAD_DIR):
+            try:
+                os.remove(os.path.join(UPLOAD_DIR, file))
+                deleted_count += 1
+            except:
+                pass
+    
+    # Clean plots
+    if os.path.exists("plots"):
+        for file in os.listdir("plots"):
+            try:
+                os.remove(os.path.join("plots", file))
+                deleted_count += 1
+            except:
+                pass
+    
     return {
         "status": "success",
         "deleted_files": deleted_count,

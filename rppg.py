@@ -1,483 +1,580 @@
-
 import cv2
 import numpy as np
 import mediapipe as mp
-from scipy.signal import butter, filtfilt, find_peaks, hilbert, detrend
+from scipy.signal import butter, filtfilt, welch, find_peaks
 from scipy.fft import fft, fftfreq
-from scipy.stats import pearsonr
+from scipy.stats import skew, kurtosis
 import matplotlib.pyplot as plt
-import base64
-from io import BytesIO
+import os
 
-# Initialize face detection
+# -------------------- MediaPipe --------------------
 mp_face = mp.solutions.face_mesh.FaceMesh(
+    static_image_mode=False,
     max_num_faces=1,
-    min_detection_confidence=0.6
+    refine_landmarks=True,
+    min_detection_confidence=0.6,
+    min_tracking_confidence=0.6
 )
 
-# ============= 1. SKIN SEGMENTATION =============
-def extract_skin_pixels(roi):
-    if roi is None or roi.size == 0:
-        return None
-    
-    # YCrCb color space for robust skin detection
-    ycrcb = cv2.cvtColor(roi, cv2.COLOR_BGR2YCrCb)
-    lower = np.array([0, 133, 77], dtype=np.uint8)
-    upper = np.array([255, 173, 127], dtype=np.uint8)
-    mask = cv2.inRange(ycrcb, lower, upper)
-    
-    # Clean mask with morphology
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    
-    # Check if enough skin pixels exist
-    if np.sum(mask > 0) < 0.3 * mask.size:
-        return None
-    
-    # Return mean RGB of skin pixels only
-    roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-    skin_pixels = roi_rgb[mask > 0]
-    return np.mean(skin_pixels, axis=0) if len(skin_pixels) > 0 else None
-
-# ============= 2. SIGNAL FILTERING =============
-def bandpass_filter(signal, fps, low=0.7, high=4.0):
+# -------------------- Advanced Filtering --------------------
+def bandpass_filter(signal, fps, low_hz=0.7, high_hz=4.0, order=4):
+    """Enhanced bandpass filter with higher order for better attenuation"""
     nyquist = fps / 2.0
-    b, a = butter(4, [low/nyquist, high/nyquist], btype='band')
+    low = low_hz / nyquist
+    high = high_hz / nyquist
+    
+    low = max(0.01, min(low, 0.99))
+    high = max(0.01, min(high, 0.99))
+    
+    if low >= high:
+        low = high - 0.1
+    
+    b, a = butter(order, [low, high], btype='band')
     return filtfilt(b, a, signal)
 
-# ============= 3. POS METHOD =============
-def extract_pulse_pos(rgb_signals):
+def detrend_signal(signal):
+    """Remove linear trend from signal"""
+    from scipy.signal import detrend
+    return detrend(signal)
+
+# -------------------- POS Method (Plane-Orthogonal-to-Skin) --------------------
+def apply_pos_method(rgb_signals):
     rgb_signals = np.array(rgb_signals)
+    
     if len(rgb_signals) < 10:
         return None
     
-    # Normalize RGB channels
     mean_rgb = np.mean(rgb_signals, axis=0)
     if np.any(mean_rgb == 0):
         return None
+    
+    normalized = rgb_signals / mean_rgb
+
+    S = np.array([[0, 1, -1], [-2, 1, 1]])
+    
+    try:
+        P = np.dot(S, normalized.T)
+        
+
+        std_s1 = np.std(P[0, :])
+        std_s2 = np.std(P[1, :])
+        
+        if std_s2 == 0:
+            return P[0, :]
+        
+        alpha = std_s1 / std_s2
+        pulse = P[0, :] - alpha * P[1, :]
+        
+        return pulse
+    except:
+        return None
+
+# -------------------- CHROM Method --------------------
+def apply_chrom_method(rgb_signals, fps):
+    rgb_signals = np.array(rgb_signals)
+    
+    if len(rgb_signals) < 10:
+        return None
+    
+    # Normalize
+    mean_rgb = np.mean(rgb_signals, axis=0)
+    if np.any(mean_rgb == 0):
+        return None
+    
     normalized = rgb_signals / mean_rgb
     
-    # Project onto plane orthogonal to skin tone
-    S = np.array([[0, 1, -1], [-2, 1, 1]])
-    P = np.dot(S, normalized.T)
+    # Calculate chrominance signals
+    Xs = 3 * normalized[:, 0] - 2 * normalized[:, 1]
+    Ys = 1.5 * normalized[:, 0] + normalized[:, 1] - 1.5 * normalized[:, 2]
     
-    # Extract pulse with adaptive weight
-    alpha = np.std(P[0]) / (np.std(P[1]) + 1e-10)
-    pulse = P[0] - alpha * P[1]
+    # Bandpass filter
+    Xf = bandpass_filter(Xs, fps)
+    Yf = bandpass_filter(Ys, fps)
+    
+    # Calculate alpha
+    std_x = np.std(Xf)
+    std_y = np.std(Yf)
+    
+    if std_y == 0:
+        return Xf
+    
+    alpha = std_x / std_y
+    pulse = Xf - alpha * Yf
+    
     return pulse
 
-# ============= 4. CROSS-ROI COHERENCE =============
-def compute_coherence(signal1, signal2):
-    if len(signal1) != len(signal2) or len(signal1) < 30:
-        return None
-    
-    # Correlation coefficient
-    correlation, _ = pearsonr(signal1, signal2)
-    
-    # Phase synchronization using Hilbert transform
-    phase1 = np.angle(hilbert(signal1))
-    phase2 = np.angle(hilbert(signal2))
-    phase_diff = phase1 - phase2
-    phase_sync = np.abs(np.mean(np.exp(1j * phase_diff)))
-    
-    return {
-        'correlation': float(correlation),
-        'phase_sync': float(phase_sync),
-        'coherent': bool(correlation > 0.6)  # Threshold for real videos
-    }
+# -------------------- ROI Extraction with Better Handling --------------------
+def get_roi_from_landmarks(frame, landmarks, indices):
+    h, w, _ = frame.shape
+    xs, ys = [], []
 
-# ============= 5. SLIDING WINDOW ANALYSIS =============
-def analyze_windows(signal, fps, window_sec=4):
-    window_size = int(window_sec * fps)
-    step = window_size // 2  # 50% overlap
-    
-    # For very short videos, use smaller windows
-    if len(signal) < window_size:
-        window_sec = max(2, len(signal) // (2 * fps))  # Minimum 2 seconds
-        window_size = int(window_sec * fps)
-        step = window_size // 2
-    
-    if len(signal) < window_size:
-        return None
-    
-    window_verdicts = []
-    window_features = []
-    
-    # Analyze each window
-    for start in range(0, len(signal) - window_size, step):
-        window = signal[start:start + window_size]
-        features = extract_features(window, fps)
-        
-        if features:
-            window_features.append(features)
-            # Simple classification: good HR + SNR = REAL
-            is_real = (50 <= features['hr'] <= 120 and features['snr'] > 2.0)
-            window_verdicts.append('REAL' if is_real else 'FAKE')
-    
-    if not window_verdicts:
-        return None
-    
-    # Majority voting
-    real_count = window_verdicts.count('REAL')
-    
-    # Check temporal consistency
-    hrs = [f['hr'] for f in window_features]
-    hr_consistency = 1.0 / (1.0 + np.std(hrs))
-    
-    return {
-        'total_windows': len(window_verdicts),
-        'real_windows': real_count,
-        'fake_windows': len(window_verdicts) - real_count,
-        'consensus': 'REAL' if real_count > len(window_verdicts)/2 else 'FAKE',
-        'hr_consistency': float(hr_consistency),
-        'features': window_features
-    }
+    for idx in indices:
+        if idx >= len(landmarks):
+            continue
+        lm = landmarks[idx]
+        xs.append(int(lm.x * w))
+        ys.append(int(lm.y * h))
 
-# ============= 6. FEATURE EXTRACTION =============
-def extract_features(signal, fps):
-    # Preprocess
-    signal = detrend(signal)
-    signal = bandpass_filter(signal, fps)
+    if len(xs) < 3 or len(ys) < 3:
+        return None
+
+    x1, x2 = max(min(xs), 0), min(max(xs), w)
+    y1, y2 = max(min(ys), 0), min(max(ys), h)
     
-    # FFT for frequency analysis
-    fft_vals = np.abs(fft(signal))
-    freqs = fftfreq(len(signal), 1/fps)
-    
-    # Focus on heart rate range (0.7-4.0 Hz = 42-240 BPM)
-    hr_mask = (freqs >= 0.7) & (freqs <= 4.0)
-    hr_power = fft_vals[hr_mask]
-    hr_freqs = freqs[hr_mask]
-    
-    if len(hr_power) == 0:
+    # Ensure minimum ROI size
+    if (x2 - x1) < 10 or (y2 - y1) < 10:
+        return None
+
+    return frame[y1:y2, x1:x2]
+
+def extract_rgb_from_roi(roi):
+    if roi is None or roi.size == 0:
         return None
     
-    # Find dominant frequency (heart rate)
-    peak_idx = np.argmax(hr_power)
-    heart_rate = hr_freqs[peak_idx] * 60  # Convert to BPM
+    # Convert to RGB
+    roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
     
-    # Signal quality metrics
-    snr = np.max(hr_power) / (np.median(hr_power) + 1e-10)
-    power_ratio = np.sum(hr_power) / (np.sum(fft_vals) + 1e-10)
+    mean_rgb = np.mean(roi_rgb.reshape(-1, 3), axis=0)
+    if mean_rgb[0] < mean_rgb[2]:
+        return None
     
-    # Peak regularity
-    peaks, _ = find_peaks(signal, distance=int(fps*0.5))
-    regularity = 0.0
+    return mean_rgb
+
+# -------------------- Motion Analysis --------------------
+def calculate_motion_robustly(prev_gray, gray):
+    """Enhanced motion estimation with error handling"""
+    try:
+        flow = cv2.calcOpticalFlowFarneback(
+            prev_gray, gray, None,
+            pyr_scale=0.5, levels=3, winsize=15,
+            iterations=3, poly_n=5, poly_sigma=1.2, flags=0
+        )
+        magnitude = np.sqrt(flow[..., 0]**2 + flow[..., 1]**2)
+        return np.mean(magnitude)
+    except:
+        return 0.0
+
+# -------------------- Advanced Feature Extraction --------------------
+def extract_advanced_features(signal, fps):
+    features = {}
+    
+    if len(signal) < fps * 3:
+        return None
+    
+    # Detrend and filter
+    detrended = detrend_signal(signal)
+    filtered = bandpass_filter(detrended, fps)
+    
+    # ========== Time Domain Features ==========
+    features['std'] = np.std(filtered)
+    features['mean_abs'] = np.mean(np.abs(filtered))
+    features['rms'] = np.sqrt(np.mean(filtered**2))
+    features['skewness'] = skew(filtered)
+    features['kurtosis'] = kurtosis(filtered)
+    
+    # Peak detection
+    peaks, properties = find_peaks(filtered, distance=int(fps*0.5), prominence=0.1*np.std(filtered))
+    features['num_peaks'] = len(peaks)
+    
     if len(peaks) > 1:
-        intervals = np.diff(peaks) / fps
-        regularity = 1.0 / (1.0 + np.std(intervals))
+        peak_intervals = np.diff(peaks) / fps
+        features['peak_interval_mean'] = np.mean(peak_intervals)
+        features['peak_interval_std'] = np.std(peak_intervals)
+        features['peak_regularity'] = 1.0 / (1.0 + features['peak_interval_std'])
+    else:
+        features['peak_interval_mean'] = 0
+        features['peak_interval_std'] = 0
+        features['peak_regularity'] = 0
     
-    return {
-        'hr': float(heart_rate),
-        'snr': float(snr),
-        'power_ratio': float(power_ratio),
-        'regularity': float(regularity),
-        'signal_strength': float(np.std(signal))
-    }
+    # ========== Frequency Domain Features ==========
+    
+    # FFT analysis
+    N = len(filtered)
+    fft_vals = np.abs(fft(filtered))
+    freqs = fftfreq(N, d=1/fps)
+    
+    # Focus on physiological range (0.7-4.0 Hz = 42-240 BPM)
+    hr_mask = (freqs >= 0.7) & (freqs <= 4.0)
+    
+    if np.any(hr_mask):
+        hr_freqs = freqs[hr_mask]
+        hr_power = fft_vals[hr_mask]
+        
+        # Dominant frequency
+        peak_idx = np.argmax(hr_power)
+        features['dominant_freq'] = hr_freqs[peak_idx]
+        features['heart_rate_bpm'] = hr_freqs[peak_idx] * 60
+        features['peak_power'] = hr_power[peak_idx]
+        
+        # Power concentration
+        total_power = np.sum(fft_vals)
+        hr_power_sum = np.sum(hr_power)
+        features['hr_power_ratio'] = hr_power_sum / (total_power + 1e-10)
+        
+        # Spectral purity (how concentrated is the power around peak)
+        top_3_power = np.sum(np.sort(hr_power)[-3:])
+        features['spectral_purity'] = top_3_power / (hr_power_sum + 1e-10)
+        
+        # SNR estimation
+        signal_power = np.max(hr_power)
+        noise_power = np.median(hr_power)
+        features['snr'] = signal_power / (noise_power + 1e-10)
+        
+        # Spectral entropy (regularity measure)
+        normalized_power = hr_power / (hr_power_sum + 1e-10)
+        entropy = -np.sum(normalized_power * np.log2(normalized_power + 1e-10))
+        features['spectral_entropy'] = entropy
+        
+    else:
+        features.update({
+            'dominant_freq': 0, 'heart_rate_bpm': 0, 'peak_power': 0,
+            'hr_power_ratio': 0, 'spectral_purity': 0, 'snr': 0, 'spectral_entropy': 0
+        })
+    
+    # Welch's method for power spectral density (more robust than FFT)
+    try:
+        f_welch, psd_welch = welch(filtered, fps, nperseg=min(256, len(filtered)))
+        hr_mask_welch = (f_welch >= 0.7) & (f_welch <= 4.0)
+        
+        if np.any(hr_mask_welch):
+            features['psd_peak'] = np.max(psd_welch[hr_mask_welch])
+            features['psd_mean'] = np.mean(psd_welch[hr_mask_welch])
+        else:
+            features['psd_peak'] = 0
+            features['psd_mean'] = 0
+    except:
+        features['psd_peak'] = 0
+        features['psd_mean'] = 0
+    
+    return features
 
-# ============= 7. PHYSIOLOGICAL RULES =============
-def check_physiology(features, coherence):
-    rules = {
-        'valid_hr': bool(42 <= features['hr'] <= 180),
-        'good_snr': bool(features['snr'] > 1.5),
-        'concentrated_spectrum': bool(features['power_ratio'] > 0.25),
-        'regular_peaks': bool(features['regularity'] > 0.5),
-        'cross_roi_sync': bool(coherence and coherence['coherent'])
-    }
-    
-    passed = sum(rules.values())
-    return {
-        'rules': rules,
-        'passed': int(passed),
-        'total': int(len(rules)),
-        'score': float(passed / len(rules))
-    }
+# -------------------- Suspicious Segment Detection (Enhanced) --------------------
+def detect_suspicious_segments(signal, fps, features):
+    """Enhanced suspicious segment detection with multiple criteria"""
+    window_sec = 3.0
+    step_sec = 1.0
+    window = int(window_sec * fps)
+    step = int(step_sec * fps)
 
-# ============= 8. SUSPICIOUS SEGMENTS =============
-def find_suspicious_segments(signal, fps, window_features):
-    """Find specific time segments that look fake"""
-    segments = []
+    suspicious = []
+    global_std = np.std(signal)
     
-    # Adapt window size for shorter videos
-    window_sec = min(4, len(signal) / fps / 2)  # Use smaller windows for short videos
-    step_sec = window_sec / 2
-    
-    # Check each window
-    for i, features in enumerate(window_features):
-        start_time = i * step_sec
-        end_time = start_time + window_sec
+    for start in range(0, len(signal) - window, step):
+        segment = signal[start:start + window]
+        
+        # Multiple detection criteria
+        amp = np.max(segment) - np.min(segment)
+        seg_std = np.std(segment)
+        seg_mean = np.mean(np.abs(segment))
         
         reasons = []
         
-        # Check multiple criteria
-        if features['hr'] < 42 or features['hr'] > 180:
-            reasons.append("Invalid heart rate")
-        if features['snr'] < 1.5:
-            reasons.append("Low signal quality")
-        if features['regularity'] < 0.4:
-            reasons.append("Irregular heartbeat")
+        # Low amplitude variation
+        if amp < 0.3 * global_std:
+            reasons.append("Very low amplitude variation")
+        
+        # Unusual standard deviation
+        if seg_std < 0.2 * global_std or seg_std > 3.0 * global_std:
+            reasons.append("Abnormal signal variability")
+        
+        # Check for flat segments (common in deepfakes)
+        diff = np.diff(segment)
+        if np.sum(np.abs(diff) < 0.01 * global_std) > 0.7 * len(diff):
+            reasons.append("Suspiciously flat signal")
         
         if reasons:
-            segments.append({
-                'start': round(start_time, 2),
-                'end': round(end_time, 2),
-                'reasons': reasons
+            suspicious.append({
+                "start_time_sec": round(start / fps, 2),
+                "end_time_sec": round((start + window) / fps, 2),
+                "reasons": reasons
             })
     
-    # Also check for flat regions in full signal
-    check_window = min(int(2 * fps), len(signal) // 3)  # Adaptive window size
-    global_std = np.std(signal)
-    
-    for start in range(0, len(signal) - check_window, int(fps)):
-        segment = signal[start:start + check_window]
-        if np.max(segment) - np.min(segment) < 0.3 * global_std:
-            start_time = round(start / fps, 2)
-            end_time = round((start + check_window) / fps, 2)
-            
-            # Avoid duplicates
-            if not any(abs(s['start'] - start_time) < 2 for s in segments):
-                segments.append({
-                    'start': start_time,
-                    'end': end_time,
-                    'reasons': ['Low amplitude variation']
-                })
-    
-    return sorted(segments, key=lambda x: x['start']) if segments else None
+    return suspicious if suspicious else None
 
-# ============= 9. VISUALIZATION =============
-def create_plots(signal, fps, features):
-    """Generate plots and save to plots folder"""
-    os.makedirs("plots", exist_ok=True)
-    
-    # Plot 1: Signal waveform
-    fig, ax = plt.subplots(figsize=(12, 4))
-    time = np.arange(len(signal)) / fps
-    ax.plot(time, signal, linewidth=0.8, color='#2E86AB')
-    ax.set_title('rPPG Signal', fontsize=14, fontweight='bold')
-    ax.set_xlabel('Time (seconds)')
-    ax.set_ylabel('Amplitude')
-    ax.grid(alpha=0.3)
-    
-    plt.savefig('plots/rppg_waveform.png', dpi=100, bbox_inches='tight')
-    plt.close()
-    
-    # Plot 2: Frequency spectrum
-    fig, ax = plt.subplots(figsize=(12, 4))
-    fft_vals = np.abs(fft(signal))
-    freqs = fftfreq(len(signal), 1/fps)
-    mask = (freqs >= 0) & (freqs <= 5)
-    
-    ax.plot(freqs[mask], fft_vals[mask], linewidth=1.5, color='#A23B72')
-    ax.axvline(features['hr']/60, color='red', linestyle='--', 
-               label=f"HR: {features['hr']:.1f} BPM")
-    ax.fill_between([0.7, 4.0], 0, max(fft_vals[mask]), 
-                     alpha=0.2, color='green', label='Physiological range')
-    ax.set_title('Frequency Spectrum', fontsize=14, fontweight='bold')
-    ax.set_xlabel('Frequency (Hz)')
-    ax.set_ylabel('Magnitude')
-    ax.legend()
-    ax.grid(alpha=0.3)
-    
-    plt.savefig('plots/fft_spectrum.png', dpi=100, bbox_inches='tight')
-    plt.close()
-    
-    return {
-        'waveform_saved': 'plots/rppg_waveform.png',
-        'spectrum_saved': 'plots/fft_spectrum.png'
-    }
+# -------------------- Advanced Classification Logic --------------------
+def classify_video(features, motion_penalty):
 
-# ============= 10. MAIN FUNCTION =============
+    if features is None:
+        return "FAKE", 0.0, "Insufficient signal quality"
+    
+    score = 0.0
+    max_score = 100.0
+    reasons = []
+    
+    # Criterion 1: Signal Strength (20 points)
+    if features['std'] > 0.5:
+        score += 20
+        reasons.append("✓ Strong signal amplitude")
+    elif features['std'] > 0.2:
+        score += 10
+        reasons.append("⚠ Moderate signal amplitude")
+    else:
+        reasons.append("✗ Weak signal amplitude")
+    
+    # Criterion 2: Heart Rate Validity (20 points)
+    hr = features['heart_rate_bpm']
+    if 50 <= hr <= 120:  # Normal resting HR
+        score += 20
+        reasons.append(f"✓ Valid heart rate: {hr:.1f} BPM")
+    elif 40 <= hr <= 150:  # Extended range
+        score += 10
+        reasons.append(f"⚠ Borderline heart rate: {hr:.1f} BPM")
+    else:
+        reasons.append(f"✗ Invalid heart rate: {hr:.1f} BPM")
+    
+    # Criterion 3: Spectral Concentration (20 points)
+    if features['hr_power_ratio'] > 0.4:
+        score += 20
+        reasons.append("✓ Strong spectral concentration")
+    elif features['hr_power_ratio'] > 0.2:
+        score += 10
+        reasons.append("⚠ Moderate spectral concentration")
+    else:
+        reasons.append("✗ Weak spectral concentration")
+    
+    # Criterion 4: Signal to Noise Ratio (15 points)
+    if features['snr'] > 3.0:
+        score += 15
+        reasons.append("✓ High SNR")
+    elif features['snr'] > 1.5:
+        score += 8
+        reasons.append("⚠ Moderate SNR")
+    else:
+        reasons.append("✗ Low SNR")
+    
+    # Criterion 5: Peak Regularity (15 points)
+    if features['peak_regularity'] > 0.7:
+        score += 15
+        reasons.append("✓ Regular heartbeat pattern")
+    elif features['peak_regularity'] > 0.4:
+        score += 8
+        reasons.append("⚠ Somewhat irregular pattern")
+    else:
+        reasons.append("✗ Irregular heartbeat pattern")
+    
+    # Criterion 6: Spectral Purity (10 points)
+    if features['spectral_purity'] > 0.6:
+        score += 10
+        reasons.append("✓ Clean frequency spectrum")
+    elif features['spectral_purity'] > 0.3:
+        score += 5
+        reasons.append("⚠ Noisy frequency spectrum")
+    else:
+        reasons.append("✗ Very noisy spectrum")
+    
+    # Motion penalty
+    motion_penalty_score = min(motion_penalty * 10, 20)
+    score -= motion_penalty_score
+    if motion_penalty > 1.0:
+        reasons.append(f"⚠ High motion detected (penalty: -{motion_penalty_score:.1f})")
+    
+    # Calculate confidence
+    confidence = max(0.0, min(score / max_score, 1.0))
+    
+    # Final verdict with threshold
+    THRESHOLD = 0.45  # 45% confidence threshold
+    verdict = "REAL" if confidence >= THRESHOLD else "FAKE"
+    
+    reason_text = "\n".join(reasons)
+    
+    return verdict, confidence, reason_text
+
+# -------------------- Main rPPG Extraction (Enhanced) --------------------
 def extract_rppg(video_path):
-    """Main extraction and analysis pipeline"""
-    
     cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    fps = cap.get(cv2.CAP_PROP_FPS)
     
-    # Storage for signals
+    if fps == 0:
+        fps = 30  # Default fallback
+
+    # Signal storage for multiple methods
     forehead_rgb = []
     cheek_rgb = []
+    green_signals = []  # Backup simple method
+    
     total_frames = 0
     used_frames = 0
+    prev_gray = None
+    motion_scores = []
     
-    # Face landmark indices
+    # Enhanced landmark indices
     FOREHEAD = [10, 67, 69, 104, 108, 151, 337, 338]
-    LEFT_CHEEK = [234, 93, 132, 58, 172]
-    RIGHT_CHEEK = [454, 323, 361, 288, 397]
-    
+    LEFT_CHEEK = [234, 93, 132, 58, 172, 136]
+    RIGHT_CHEEK = [454, 323, 361, 288, 397, 365]
+
     print(f"Processing video at {fps} FPS...")
-    
-    # Extract signals from video
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-        
+
         total_frames += 1
-        
-        # Detect face
+
+        # Motion analysis
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if prev_gray is not None:
+            motion_scores.append(calculate_motion_robustly(prev_gray, gray))
+        prev_gray = gray
+
+        # Face detection
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = mp_face.process(rgb)
-        
+
         if not results.multi_face_landmarks:
             continue
-        
+
         landmarks = results.multi_face_landmarks[0].landmark
-        h, w = frame.shape[:2]
         
         # Extract ROIs
-        def get_roi(indices):
-            points = [(int(landmarks[i].x * w), int(landmarks[i].y * h)) 
-                     for i in indices if i < len(landmarks)]
-            if len(points) < 3:
-                return None
-            xs, ys = zip(*points)
-            x1, x2 = max(min(xs), 0), min(max(xs), w)
-            y1, y2 = max(min(ys), 0), min(max(ys), h)
-            return frame[y1:y2, x1:x2] if x2-x1 > 10 and y2-y1 > 10 else None
+        roi_f = get_roi_from_landmarks(frame, landmarks, FOREHEAD)
+        roi_l = get_roi_from_landmarks(frame, landmarks, LEFT_CHEEK)
+        roi_r = get_roi_from_landmarks(frame, landmarks, RIGHT_CHEEK)
+
+        # Extract RGB values
+        rgb_f = extract_rgb_from_roi(roi_f)
+        rgb_l = extract_rgb_from_roi(roi_l)
+        rgb_r = extract_rgb_from_roi(roi_r)
         
-        roi_f = get_roi(FOREHEAD)
-        roi_l = get_roi(LEFT_CHEEK)
-        roi_r = get_roi(RIGHT_CHEEK)
+        if rgb_f is None or rgb_l is None or rgb_r is None:
+            continue
+
+        forehead_rgb.append(rgb_f)
+        cheek_rgb.append((rgb_l + rgb_r) / 2)
         
-        # Try skin segmentation first
-        rgb_f = extract_skin_pixels(roi_f)
-        rgb_l = extract_skin_pixels(roi_l)
-        rgb_r = extract_skin_pixels(roi_r)
+        # Backup: simple green channel
+        if roi_f is not None and roi_f.size > 0:
+            green_signals.append(np.mean(roi_f[:, :, 1]))
         
-        # Fallback: if skin segmentation fails, use simple mean
-        if rgb_f is None and roi_f is not None:
-            rgb_f = np.mean(cv2.cvtColor(roi_f, cv2.COLOR_BGR2RGB).reshape(-1, 3), axis=0)
-        if rgb_l is None and roi_l is not None:
-            rgb_l = np.mean(cv2.cvtColor(roi_l, cv2.COLOR_BGR2RGB).reshape(-1, 3), axis=0)
-        if rgb_r is None and roi_r is not None:
-            rgb_r = np.mean(cv2.cvtColor(roi_r, cv2.COLOR_BGR2RGB).reshape(-1, 3), axis=0)
-        
-        if rgb_f is not None and rgb_l is not None and rgb_r is not None:
-            forehead_rgb.append(rgb_f)
-            cheek_rgb.append((rgb_l + rgb_r) / 2)
-            used_frames += 1
-    
+        used_frames += 1
+
     cap.release()
-    
-    # Check if enough frames (adaptive minimum based on video length)
-    min_required = max(int(fps * 2), 60)  # At least 2 seconds OR 60 frames
-    frame_quality = (used_frames / total_frames * 100) if total_frames > 0 else 0
-    
-    if used_frames < min_required:
+
+    # Validate sufficient frames
+    min_frames = int(fps * 5)  # Minimum 5 seconds
+    if used_frames < min_frames:
         return None, {
-            "error": f"Insufficient quality frames: {used_frames}/{total_frames} frames usable ({frame_quality:.1f}% pass rate)",
-            "suggestion": "Ensure: (1) Face clearly visible, (2) Good lighting, (3) Minimal motion, (4) Camera focused on face",
+            "error": f"Insufficient stable frames (got {used_frames}, need {min_frames})",
             "fps": fps,
             "total_frames": total_frames,
-            "used_frames": used_frames,
-            "min_required": min_required
+            "used_frames": used_frames
+        }
+
+    print(f"Extracted {used_frames}/{total_frames} usable frames")
+
+    # Calculate motion penalty
+    motion_penalty = np.mean(motion_scores) if motion_scores else 0
+    
+    # ========== Method 1: POS Method (Primary) ==========
+    forehead_pos = apply_pos_method(forehead_rgb)
+    cheek_pos = apply_pos_method(cheek_rgb)
+    
+    if forehead_pos is not None and cheek_pos is not None:
+        # Fuse signals
+        fused_pos = 0.6 * forehead_pos + 0.4 * cheek_pos
+        fused_pos = detrend_signal(fused_pos)
+        filtered_pos = bandpass_filter(fused_pos, fps)
+        primary_signal = filtered_pos
+        method_used = "POS"
+    else:
+        primary_signal = None
+    
+    # ========== Method 2: CHROM Method (Secondary) ==========
+    if primary_signal is None:
+        forehead_chrom = apply_chrom_method(forehead_rgb, fps)
+        cheek_chrom = apply_chrom_method(cheek_rgb, fps)
+        
+        if forehead_chrom is not None and cheek_chrom is not None:
+            fused_chrom = 0.6 * forehead_chrom + 0.4 * cheek_chrom
+            filtered_chrom = bandpass_filter(fused_chrom, fps)
+            primary_signal = filtered_chrom
+            method_used = "CHROM"
+    
+    # ========== Method 3: Simple Green Channel (Fallback) ==========
+    if primary_signal is None and len(green_signals) > 0:
+        green_array = np.array(green_signals)
+        green_detrended = detrend_signal(green_array)
+        primary_signal = bandpass_filter(green_detrended, fps)
+        method_used = "Green Channel"
+    
+    if primary_signal is None:
+        return None, {
+            "error": "Failed to extract rPPG signal using all methods",
+            "fps": fps,
+            "total_frames": total_frames,
+            "used_frames": used_frames
         }
     
-    print(f"Extracted {used_frames}/{total_frames} frames ({frame_quality:.1f}% quality)")
+    print(f"Using {method_used} method")
     
-    # Extract pulse signals using POS method
-    forehead_pulse = extract_pulse_pos(forehead_rgb)
-    cheek_pulse = extract_pulse_pos(cheek_rgb)
+    # ========== Extract Advanced Features ==========
+    features = extract_advanced_features(primary_signal, fps)
     
-    if forehead_pulse is None or cheek_pulse is None:
-        return None, {"error": "Failed to extract pulse signals"}
+    if features is None:
+        return None, {
+            "error": "Feature extraction failed",
+            "fps": fps,
+            "total_frames": total_frames,
+            "used_frames": used_frames
+        }
     
-    # Preprocess signals
-    forehead_pulse = bandpass_filter(detrend(forehead_pulse), fps)
-    cheek_pulse = bandpass_filter(detrend(cheek_pulse), fps)
+    # ========== Classification ==========
+    verdict, confidence, reason_text = classify_video(features, motion_penalty)
     
-    # Fuse signals (weighted average)
-    fused_signal = 0.6 * forehead_pulse + 0.4 * cheek_pulse
+    # ========== Suspicious Segments ==========
+    suspicious_segments = detect_suspicious_segments(primary_signal, fps, features)
     
-    # === ANALYSIS ===
+    # ========== Generate Plots ==========
+    os.makedirs("plots", exist_ok=True)
     
-    # 1. Cross-ROI coherence
-    print("Computing cross-ROI coherence...")
-    coherence = compute_coherence(forehead_pulse, cheek_pulse)
+    # Plot 1: rPPG Waveform
+    plt.figure(figsize=(12, 4))
+    time_axis = np.arange(len(primary_signal)) / fps
+    plt.plot(time_axis, primary_signal, linewidth=0.8)
+    plt.title(f"rPPG Signal ({method_used} Method)")
+    plt.xlabel("Time (seconds)")
+    plt.ylabel("Normalized Amplitude")
+    plt.grid(True, alpha=0.3)
+    waveform_path = "plots/rppg_waveform.png"
+    plt.savefig(waveform_path, dpi=150)
+    plt.close()
     
-    # 2. Sliding window temporal analysis
-    print("Performing sliding-window analysis...")
-    window_analysis = analyze_windows(fused_signal, fps)
+    # Plot 2: FFT Spectrum
+    N = len(primary_signal)
+    fft_vals = np.abs(fft(primary_signal))
+    freqs = fftfreq(N, d=1/fps)
     
-    if window_analysis is None:
-        return None, {"error": "Window analysis failed"}
+    plt.figure(figsize=(12, 4))
+    hr_mask = (freqs >= 0) & (freqs <= 5)
+    plt.plot(freqs[hr_mask], fft_vals[hr_mask], linewidth=1.5)
+    plt.axvline(x=features['dominant_freq'], color='r', linestyle='--', 
+                label=f'Dominant: {features["heart_rate_bpm"]:.1f} BPM')
+    plt.fill_between([0.7, 4.0], 0, plt.ylim()[1], alpha=0.2, color='green', 
+                     label='Physiological Range')
+    plt.title("Frequency Spectrum")
+    plt.xlabel("Frequency (Hz)")
+    plt.ylabel("Magnitude")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    fft_path = "plots/fft_spectrum.png"
+    plt.savefig(fft_path, dpi=150)
+    plt.close()
     
-    # 3. Global features
-    global_features = extract_features(fused_signal, fps)
-    
-    if global_features is None:
-        return None, {"error": "Feature extraction failed"}
-    
-    # 4. Physiological plausibility
-    plausibility = check_physiology(global_features, coherence)
-    
-    # 5. Find suspicious segments
-    suspicious = find_suspicious_segments(
-        fused_signal, fps, window_analysis['features']
-    )
-    
-    # === FINAL CLASSIFICATION ===
-    
-    score = 0
-    
-    # Window consensus (40 points)
-    if window_analysis['consensus'] == 'REAL':
-        score += 40 * (window_analysis['real_windows'] / window_analysis['total_windows'])
-    
-    # Temporal consistency (20 points)
-    score += 20 * window_analysis['hr_consistency']
-    
-    # Physiological rules (25 points)
-    score += 25 * plausibility['score']
-    
-    # Cross-ROI coherence (15 points)
-    if coherence and coherence['coherent']:
-        score += 15
-    
-    confidence = float(max(0.0, min(score / 100, 1.0)))
-    verdict = "REAL" if confidence >= 0.50 else "FAKE"
-    
-    # Generate plots (saved to plots folder)
-    print("Generating visualizations...")
-    plot_info = create_plots(fused_signal, fps, global_features)
-    
-    # === RETURN RESULTS ===
-    
-    return {
+    # Compile results
+    result = {
         "verdict": verdict,
         "confidence": float(confidence),
-        "confidence_percentage": f"{confidence * 100:.1f}%",
-        
-        "video_info": {
-            "fps": float(fps),
-            "total_frames": int(total_frames),
-            "used_frames": int(used_frames),
-            "duration_sec": round(used_frames / fps, 2)
-        },
-        
-        "physiological_metrics": {
-            "heart_rate_bpm": float(global_features['hr']),
-            "signal_strength": float(global_features['signal_strength']),
-            "snr": float(global_features['snr']),
-            "peak_regularity": float(global_features['regularity']),
-            "spectral_concentration": float(global_features['power_ratio'])
-        },
-        
-        "temporal_analysis": {
-            "total_windows": window_analysis['total_windows'],
-            "real_windows": window_analysis['real_windows'],
-            "fake_windows": window_analysis['fake_windows'],
-            "consensus": window_analysis['consensus'],
-            "hr_consistency": window_analysis['hr_consistency']
-        },
-        
-        "cross_roi_coherence": coherence,
-        
-        "physiological_rules": plausibility,
-        
-        "suspicious_segments": suspicious,
-        
-        "plots_saved_to": plot_info,
-        
-        "method": "POS + Skin Segmentation + Sliding Window + Cross-ROI Coherence"
-        
-    }, None
+        "reason": reason_text,
+        "method_used": method_used,
+        "features": {k: float(v) if isinstance(v, (int, float, np.number)) else v 
+                     for k, v in features.items()},
+        "fps": float(fps),
+        "total_frames": int(total_frames),
+        "used_frames": int(used_frames),
+        "motion_penalty": float(motion_penalty),
+        "waveform_plot": waveform_path,
+        "fft_plot": fft_path,
+        "suspicious_segments": suspicious_segments
+    }
+    
+    return result, None

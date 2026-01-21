@@ -55,7 +55,6 @@ def apply_pos_method(rgb_signals):
     try:
         P = np.dot(S, normalized.T)
         
-
         std_s1 = np.std(P[0, :])
         std_s2 = np.std(P[1, :])
         
@@ -291,88 +290,115 @@ def detect_suspicious_segments(signal, fps, features):
     
     return suspicious if suspicious else None
 
-# -------------------- Advanced Classification Logic --------------------
-def classify_video(features, motion_penalty):
-
+# ==================== FIXED CLASSIFICATION LOGIC ====================
+def classify_video(features, motion_penalty, suspicious_segments=None):
+    """
+    Balanced-Strict Classification Logic:
+    - Slightly tighter gates to filter improved deepfakes
+    - Requires >1.0 SNR for significant points
+    - penalizes ambiguity more than the previous relaxed version
+    """
     if features is None:
         return "FAKE", 0.0, "Insufficient signal quality"
-    
+
     score = 0.0
     max_score = 100.0
     reasons = []
-    
-    # Criterion 1: Signal Strength (20 points)
-    if features['std'] > 0.5:
+
+    # --- 1. Gating Criteria (SLIGHTLY STRICTER) ---
+    # Reject noise floor signals
+    if features['std'] < 0.01:
+        return "FAKE", 0.0, f"Signal below noise floor (std={features['std']:.4f})"
+
+    # --- 2. Scoring Criteria ---
+
+    # Criterion 1: Signal Strength (20 pts)
+    # Real rPPG > 0.2 (normalized). Weak < 0.1
+    if features['std'] > 0.18:
         score += 20
-        reasons.append("✓ Strong signal amplitude")
-    elif features['std'] > 0.2:
-        score += 10
-        reasons.append("⚠ Moderate signal amplitude")
+        reasons.append(f"Strong signal: {features['std']:.3f}")
+    elif features['std'] > 0.05:  # Raised from 0.04
+        # Linear scaling for weak-to-moderate signals
+        pts = 8 + int((features['std'] - 0.05) * 80)
+        score += min(pts, 15)
+        reasons.append(f"Moderate signal: {features['std']:.3f} (+{min(pts, 15)})")
     else:
-        reasons.append("✗ Weak signal amplitude")
-    
-    # Criterion 2: Heart Rate Validity (20 points)
-    hr = features['heart_rate_bpm']
-    if 50 <= hr <= 120:  # Normal resting HR
+        # Very weak signal
+        score += 2
+        reasons.append(f"Weak signal: {features['std']:.3f}")
+
+    # Criterion 2: Signal to Noise Ratio (20 pts)
+    # Stricter: Requires signal to be larger than noise
+    if features['snr'] > 2.2:
         score += 20
-        reasons.append(f"✓ Valid heart rate: {hr:.1f} BPM")
-    elif 40 <= hr <= 150:  # Extended range
-        score += 10
-        reasons.append(f"⚠ Borderline heart rate: {hr:.1f} BPM")
-    else:
-        reasons.append(f"✗ Invalid heart rate: {hr:.1f} BPM")
-    
-    # Criterion 3: Spectral Concentration (20 points)
-    if features['hr_power_ratio'] > 0.4:
-        score += 20
-        reasons.append("✓ Strong spectral concentration")
-    elif features['hr_power_ratio'] > 0.2:
-        score += 10
-        reasons.append("⚠ Moderate spectral concentration")
-    else:
-        reasons.append("✗ Weak spectral concentration")
-    
-    # Criterion 4: Signal to Noise Ratio (15 points)
-    if features['snr'] > 3.0:
+        reasons.append(f"High SNR: {features['snr']:.2f}")
+    elif features['snr'] > 1.0:  # Raised from 0.8
         score += 15
-        reasons.append("✓ High SNR")
-    elif features['snr'] > 1.5:
-        score += 8
-        reasons.append("⚠ Moderate SNR")
-    else:
-        reasons.append("✗ Low SNR")
-    
-    # Criterion 5: Peak Regularity (15 points)
-    if features['peak_regularity'] > 0.7:
-        score += 15
-        reasons.append("✓ Regular heartbeat pattern")
-    elif features['peak_regularity'] > 0.4:
-        score += 8
-        reasons.append("⚠ Somewhat irregular pattern")
-    else:
-        reasons.append("✗ Irregular heartbeat pattern")
-    
-    # Criterion 6: Spectral Purity (10 points)
-    if features['spectral_purity'] > 0.6:
-        score += 10
-        reasons.append("✓ Clean frequency spectrum")
-    elif features['spectral_purity'] > 0.3:
+        reasons.append(f"Moderate SNR: {features['snr']:.2f}")
+    elif features['snr'] > 0.5:
         score += 5
-        reasons.append("⚠ Noisy frequency spectrum")
+        reasons.append(f"Low SNR: {features['snr']:.2f}")
     else:
-        reasons.append("✗ Very noisy spectrum")
+        reasons.append(f"Very Low SNR: {features['snr']:.2f}")
+
+    # Criterion 3: Heart Rate Validity (20 pts)
+    hr = features['heart_rate_bpm']
+    if 50 <= hr <= 135:
+        if features['snr'] > 0.8: # Raised from 0.5
+            score += 20
+            reasons.append(f"Valid HR: {hr:.1f} BPM")
+        else:
+            score += 8
+            reasons.append(f"Valid HR (Noisy): {hr:.1f} BPM")
+    elif 40 <= hr <= 180:
+        score += 5
+        reasons.append(f"Borderline HR: {hr:.1f} BPM")
+    else:
+        reasons.append(f"Invalid HR: {hr:.1f} BPM")
+
+    # Criterion 4: Spectral Concentration (10 pts)
+    if features['hr_power_ratio'] > 0.28:
+        score += 10
+        reasons.append(f"Focused power: {features['hr_power_ratio']:.2f}")
+    elif features['hr_power_ratio'] > 0.18:
+        score += 5
+
+    # Criterion 5: Peak Regularity (15 pts)
+    if features['peak_regularity'] > 0.45:
+        score += 15
+        reasons.append(f"Regular rhythm: {features['peak_regularity']:.2f}")
+    elif features['peak_regularity'] > 0.28:
+        score += 8
+        reasons.append(f"Semi-regular: {features['peak_regularity']:.2f}")
+
+    # Criterion 6: Spectral Purity (15 pts)
+    if features['spectral_purity'] > 0.4:
+        score += 15
+        reasons.append(f"Pure spectrum: {features['spectral_purity']:.2f}")
+    elif features['spectral_purity'] > 0.25:
+        score += 10
+        reasons.append(f"Moderate purity: {features['spectral_purity']:.2f}")
+
+    # --- 3. Penalties ---
+
+    # Motion Penalty
+    if motion_penalty > 0.8:
+        deduction = min(motion_penalty * 8, 20) # Slightly higher cap
+        score -= deduction
+        reasons.append(f"Motion penalty: -{deduction:.1f}")
+
+    # Suspicious Segments Penalty
+    if suspicious_segments:
+        num_segs = len(suspicious_segments)
+        deduction = min(num_segs * 12, 40) # Higher penalty per segment
+        score -= deduction
+        reasons.append(f"Suspicious segments: -{deduction} ({num_segs})")
+
+    # --- 4. Verdict ---
+    confidence = max(0.0, min(score / 95.0, 1.0)) 
     
-    # Motion penalty
-    motion_penalty_score = min(motion_penalty * 10, 20)
-    score -= motion_penalty_score
-    if motion_penalty > 1.0:
-        reasons.append(f"⚠ High motion detected (penalty: -{motion_penalty_score:.1f})")
-    
-    # Calculate confidence
-    confidence = max(0.0, min(score / max_score, 1.0))
-    
-    # Final verdict with threshold
-    THRESHOLD = 0.45  # 45% confidence threshold
+    # 0.45 is the "Slightly Strict" cutoff
+    THRESHOLD = 0.45
     verdict = "REAL" if confidence >= THRESHOLD else "FAKE"
     
     reason_text = "\n".join(reasons)
@@ -403,6 +429,9 @@ def extract_rppg(video_path):
     RIGHT_CHEEK = [454, 323, 361, 288, 397, 365]
 
     print(f"Processing video at {fps} FPS...")
+    
+    max_duration_sec = 15.0  # Limit processing to first 15 seconds
+    max_frames = int(max_duration_sec * fps)
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -410,23 +439,42 @@ def extract_rppg(video_path):
             break
 
         total_frames += 1
+        
+        # Optimization: Stop after max_duration
+        if total_frames > max_frames:
+            print(f"Reached max duration of {max_duration_sec}s, stopping analysis.")
+            break
+
+        # Optimization: Downscale for expensive operations
+        h, w = frame.shape[:2]
+        scale_factor = 640 / w if w > 640 else 1.0
+        
+        if scale_factor < 1.0:
+            small_w = int(w * scale_factor)
+            small_h = int(h * scale_factor)
+            frame_small = cv2.resize(frame, (small_w, small_h))
+        else:
+            frame_small = frame
 
         # Motion analysis
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray_small = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
+        gray_motion = cv2.resize(gray_small, (320, int(320*h/w))) if w > 320 else gray_small
+        
         if prev_gray is not None:
-            motion_scores.append(calculate_motion_robustly(prev_gray, gray))
-        prev_gray = gray
+            if prev_gray.shape == gray_motion.shape:
+                motion_scores.append(calculate_motion_robustly(prev_gray, gray_motion))
+        prev_gray = gray_motion
 
         # Face detection
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = mp_face.process(rgb)
+        rgb_small = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
+        results = mp_face.process(rgb_small)
 
         if not results.multi_face_landmarks:
             continue
 
         landmarks = results.multi_face_landmarks[0].landmark
         
-        # Extract ROIs
+        # Extract ROIs from original high-res frame
         roi_f = get_roi_from_landmarks(frame, landmarks, FOREHEAD)
         roi_l = get_roi_from_landmarks(frame, landmarks, LEFT_CHEEK)
         roi_r = get_roi_from_landmarks(frame, landmarks, RIGHT_CHEEK)
@@ -470,7 +518,6 @@ def extract_rppg(video_path):
     cheek_pos = apply_pos_method(cheek_rgb)
     
     if forehead_pos is not None and cheek_pos is not None:
-        # Fuse signals
         fused_pos = 0.6 * forehead_pos + 0.4 * cheek_pos
         fused_pos = detrend_signal(fused_pos)
         filtered_pos = bandpass_filter(fused_pos, fps)
@@ -518,11 +565,11 @@ def extract_rppg(video_path):
             "used_frames": used_frames
         }
     
-    # ========== Classification ==========
-    verdict, confidence, reason_text = classify_video(features, motion_penalty)
-    
     # ========== Suspicious Segments ==========
     suspicious_segments = detect_suspicious_segments(primary_signal, fps, features)
+    
+    # ========== Classification ==========
+    verdict, confidence, reason_text = classify_video(features, motion_penalty, suspicious_segments)
     
     # ========== Generate Plots ==========
     os.makedirs("plots", exist_ok=True)

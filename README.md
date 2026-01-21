@@ -1,12 +1,5 @@
 # 🧠 Deepfake Detection Using Physiological rPPG Signals (No Training Required)
 
-> Scan the QR code → Understand the logic → Trust the biology
-
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/ecd00449-610a-466d-ab15-5ecdd727cd43"
-       alt="rPPG QR Code"
-       width="120"/>
-</p>
 
 
 ---

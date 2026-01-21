@@ -1,6 +1,27 @@
 # 🧠 Deepfake Detection Using Physiological rPPG Signals (No Training Required)
 
+## Table of Content
 
+| Section | Description |
+|--------|-------------|
+| Introduction | Overview of deepfake threats and motivation for physiological detection |
+| Problem Statement | Why existing deepfake detectors fail against unseen attack types |
+| Why Physiological rPPG-Based Detection? | Justification for using biological signals instead of trained datasets |
+| System Overview | High-level architecture of the rPPG deepfake detection system |
+| Workflow | Step-by-step pipeline from video input to final verdict |
+| Key Features | Summary of major technical contributions and enhancements |
+| Signal Processing Pipeline | Detailed explanation of rPPG extraction and processing stages |
+| Physiological Parameters Explained | Explanation of heartbeat-related metrics used for detection |
+| Thresholds and Decision Logic | Exact thresholds and scoring rules for REAL vs FAKE verdict |
+| Suspicious Segment Detection | How temporal inconsistencies and artifacts are identified |
+| Visualization Outputs | Interpretation of waveform and frequency spectrum plots |
+| Example Output Explanation | Line-by-line explanation of a sample API response |
+| Limitations | Known constraints and failure cases |
+| Robustness Against New Attacks | Why biological signals generalize across deepfake methods |
+| Future Enhancements | Planned improvements and research directions |
+| How to Run the Project | Instructions to execute the FastAPI-based system |
+| Conclusion | Summary of findings and impact |
+| References | Research papers and technical sources |
 
 ---
 
